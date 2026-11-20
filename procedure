@@ -1,0 +1,162 @@
+### 실행전 파일설정과 위치가 맞는지 확인할 것 ###
+
+
+#1
+!nvidia-smi
+
+#2 패키치 설치
+%pip install -q -U ultralytics roboflow
+import ultralytics
+ultralytics.checks()
+#3 roboflow API KEY 설정
+from google.colab import userdata
+ROBOFLOW_API_KEY = userdata.get('ROBOFLOW_API_KEY')
+print('API 키 불러오기 성공' if ROBOFLOW_API_KEY else '키가 비어 있습니다')
+
+#4 데이터셋 다운로드  (주소참고)
+WORKSPACE = 'your-workspace'   # ← 바꾸기
+PROJECT   = 'your-project'     # ← 바꾸기
+VERSION   = 2                  # ← Fit으로 새로 만든 버전 번호
+
+from roboflow import Roboflow
+rf = Roboflow(api_key=ROBOFLOW_API_KEY)
+version = rf.workspace(WORKSPACE).project(PROJECT).version(VERSION)
+
+DATA_DIR = f'/content/datasets/{PROJECT}-v{VERSION}'
+try:
+    dataset = version.download('yolov11', location=DATA_DIR, overwrite=True)
+except Exception as e:
+    print('yolov11 형식 실패 → yolov8 형식으로 재시도:', e)
+    dataset = version.download('yolov8', location=DATA_DIR, overwrite=True)
+
+print('다운로드 위치:', dataset.location)
+!ls {dataset.location}
+
+#5 data.yaml 경로 정리
+import yaml
+from pathlib import Path
+
+root = Path(dataset.location)
+yaml_path = root / 'data.yaml'
+cfg = yaml.safe_load(open(yaml_path))
+
+cfg['path']  = str(root)
+cfg['train'] = 'train/images'
+cfg['val']   = 'valid/images'
+if (root / 'test' / 'images').exists():
+    cfg['test'] = 'test/images'
+else:
+    cfg.pop('test', None)
+cfg.pop('roboflow', None)
+
+yaml.safe_dump(cfg, open(yaml_path, 'w'), allow_unicode=True, sort_keys=False)
+DATA_YAML = str(yaml_path)
+CLASS_NAMES = cfg['names'] if isinstance(cfg['names'], list) else [cfg['names'][i] for i in sorted(cfg['names'])]
+print(open(yaml_path).read())
+
+#6 장수와 클래스 분포 확인
+from collections import Counter
+import pandas as pd
+
+def split_stats(split):
+    img_dir, lbl_dir = root / split / 'images', root / split / 'labels'
+    if not img_dir.exists():
+        return None
+    imgs = [p for p in img_dir.iterdir() if p.suffix.lower() in ('.jpg', '.jpeg', '.png')]
+    cnt, empty = Counter(), 0
+    for p in imgs:
+        lp = lbl_dir / (p.stem + '.txt')
+        lines = [l for l in open(lp).read().splitlines() if l.strip()] if lp.exists() else []
+        if not lines:
+            empty += 1
+        for l in lines:
+            cnt[int(l.split()[0])] += 1
+    return len(imgs), empty, cnt
+
+rows, totals = [], {}
+for split in ['train', 'valid', 'test']:
+    s = split_stats(split)
+    if s is None:
+        continue
+    n, empty, cnt = s
+    totals[split] = n
+    row = {'split': split, 'images': n, 'empty_images': empty}
+    row.update({name: cnt.get(i, 0) for i, name in enumerate(CLASS_NAMES)})
+    rows.append(row)
+
+df = pd.DataFrame(rows).set_index('split')
+all_n = sum(totals.values())
+print('세트 비율:', {k: f'{v / all_n:.0%}' for k, v in totals.items()})
+display(df)
+
+missing = [c for c in CLASS_NAMES if 'valid' in df.index and df.loc['valid', c] == 0]
+if missing:
+    print('⚠️ valid에 없는 클래스:', missing)
+
+#7 라벨 확인
+import random, cv2
+import matplotlib.pyplot as plt
+
+def show_labels(split='train', n=6, seed=0):
+    img_dir, lbl_dir = root / split / 'images', root / split / 'labels'
+    imgs = sorted(p for p in img_dir.iterdir() if p.suffix.lower() in ('.jpg', '.jpeg', '.png'))
+    random.Random(seed).shuffle(imgs)
+    colors = plt.cm.tab10.colors
+    fig, axes = plt.subplots((n + 1) // 2, 2, figsize=(14, 4 * ((n + 1) // 2)))
+    for ax, p in zip(axes.flat, imgs[:n]):
+        img = cv2.cvtColor(cv2.imread(str(p)), cv2.COLOR_BGR2RGB)
+        h, w = img.shape[:2]
+        lp = lbl_dir / (p.stem + '.txt')
+        for line in (open(lp).read().splitlines() if lp.exists() else []):
+            if not line.strip():
+                continue
+            c, cx, cy, bw, bh = line.split()[:5]
+            c, cx, cy, bw, bh = int(c), float(cx) * w, float(cy) * h, float(bw) * w, float(bh) * h
+            x1, y1 = int(cx - bw / 2), int(cy - bh / 2)
+            col = tuple(int(255 * v) for v in colors[c % 10])
+            cv2.rectangle(img, (x1, y1), (int(x1 + bw), int(y1 + bh)), col, 2)
+            cv2.putText(img, CLASS_NAMES[c], (x1, max(12, y1 - 4)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 1)
+        ax.imshow(img); ax.set_title(p.name[:40], fontsize=8)
+    for ax in axes.flat:
+        ax.axis('off')
+    plt.tight_layout(); plt.show()
+
+show_labels('train', n=6)
+show_labels('valid', n=4, seed=1)
+
+#8 학습
+from ultralytics import YOLO
+
+MODEL = 'yolo26n.pt'        # 정확도가 부족하면 'yolo26s.pt'
+RUN_NAME = f'{PROJECT}_v{VERSION}_{MODEL.split(".")[0]}'
+
+model = YOLO(MODEL)
+results = model.train(
+    data=DATA_YAML,
+    epochs=100,
+    patience=30,
+    imgsz=640,
+    batch=-1,
+    fliplr=0.5,
+    hsv_h=0.0,
+    project=SAVE_ROOT,
+    name=RUN_NAME,
+    exist_ok=True,
+    seed=0,
+    plots=True,
+)
+RUN_DIR = Path(SAVE_ROOT) / RUN_NAME
+print('결과 폴더:', RUN_DIR)
+
+#9 결과확인
+from IPython.display import Image as IPImage, display
+for f in ['results.png', 'confusion_matrix_normalized.png', 'BoxPR_curve.png']:
+    p = RUN_DIR / f
+    if p.exists():
+        print(f); display(IPImage(filename=str(p), width=900))
+
+#10 가중치 다운로드
+import shutil
+from google.colab import files
+pack = shutil.make_archive(f'/content/{RUN_NAME}_weights', 'zip', RUN_DIR / 'weights')
+files.download(pack)
